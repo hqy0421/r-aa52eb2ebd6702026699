@@ -788,7 +788,12 @@ def search(ctx, query, relevance, refresh):
 @click.option("--batch-size", type=int, default=100, help="Articles per batch before flushing to index")
 @click.pass_context
 def backfill_embeddings(ctx, batch_size):
-    """Generate embeddings for processed articles that are missing them."""
+    """Generate embeddings for processed articles that are missing them.
+
+    Resumable and idempotent: progress is committed per batch, so re-running
+    after an interruption continues where it left off and skips articles that
+    already have a searchable vector.
+    """
     config = ctx.obj["config"]
     db_session = ensure_db_exists(config)
 
@@ -798,8 +803,13 @@ def backfill_embeddings(ctx, batch_size):
 
     try:
         result = processor.backfill_embeddings(batch_size=batch_size)
+        if result['total'] == 0:
+            click.echo("No articles missing embeddings.")
+            return
         click.echo(f"Backfill complete: {result['succeeded']}/{result['total']} articles "
                    f"({result['failed']} failed)")
+        if result['failed']:
+            click.echo("Failed articles were left unmarked and will be retried on the next run.")
     except Exception as e:
         click.echo(f"Error during backfill: {str(e)}", err=True)
     finally:

@@ -1,10 +1,13 @@
 import os
 import json
+import math
+import numbers
 import time
 from typing import List, Dict, Any, Optional, Tuple, Callable, Union
 from datetime import datetime, timedelta
 import logging
 import requests
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from tqdm import tqdm
 import re
@@ -30,6 +33,12 @@ QUALITY_TIERS = {
     "D": 1,
 }
 
+# Embedding model / index geometry. Kept in one place so every code path
+# (generation, storage, validation, index rebuild) agrees on what a usable
+# vector looks like.
+EMBEDDING_MODEL_NAME = "all-mpnet-base-v2"
+EMBEDDING_DIM = 768
+
 
 class RSSProcessor:
     """Main processor for RSS feeds and articles."""
@@ -46,7 +55,7 @@ class RSSProcessor:
         """Lazy load the embedding model."""
         if self._embedding_model is None:
             logger.info("Loading embedding model...")
-            self._embedding_model = SentenceTransformer('all-mpnet-base-v2')
+            self._embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
         return self._embedding_model
 
     def ingest_feeds(self, lookback_days: Optional[int] = None, debug: bool = False) -> Dict[str, int]:
@@ -209,6 +218,53 @@ class RSSProcessor:
             logger.error(f"Failed to parse value analysis: {str(e)}")
             return None, None, None
 
+    @staticmethod
+    def _coerce_embedding(raw: Any) -> Optional[List[float]]:
+        """
+        Validate a raw embedding and return it as a list of finite floats.
+
+        A vector is considered usable only when it has exactly ``EMBEDDING_DIM``
+        finite numeric components. Vectors of the wrong length, with non-numeric
+        or non-finite (NaN/Inf) components, or non-iterables are rejected — these
+        are the shapes that make Annoy raise mid-build and abort a batch.
+
+        Returns:
+            Normalized vector, or ``None`` when the input is not usable.
+        """
+        if raw is None:
+            return None
+
+        try:
+            values = raw.tolist() if hasattr(raw, "tolist") else list(raw)
+        except (TypeError, ValueError):
+            return None
+
+        if len(values) != EMBEDDING_DIM:
+            return None
+
+        vector: List[float] = []
+        for value in values:
+            # bool is a subclass of int but never a valid embedding component
+            if isinstance(value, bool) or not isinstance(value, numbers.Real):
+                return None
+            component = float(value)
+            if not math.isfinite(component):
+                return None
+            vector.append(component)
+
+        return vector
+
+    @classmethod
+    def _parse_stored_vector(cls, raw: Optional[str]) -> Optional[List[float]]:
+        """Parse a JSON-serialized vector from the database, or return None."""
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return cls._coerce_embedding(parsed)
+
     def _generate_embedding(self, text: str) -> List[float]:
         """
         Generate an embedding vector for text.
@@ -218,12 +274,19 @@ class RSSProcessor:
 
         Returns:
             Embedding vector
+
+        Raises:
+            ValueError: If the model produced a vector that cannot be indexed.
         """
         # Truncate text if too long (most models have a max token limit)
         max_chars = 5000
         truncated_text = text[:max_chars] if len(text) > max_chars else text
 
-        return self.embedding_model.encode(truncated_text).tolist()
+        embedding = self._coerce_embedding(self.embedding_model.encode(truncated_text))
+        if embedding is None:
+            raise ValueError("embedding model returned an unusable vector")
+
+        return embedding
 
     def _calculate_title_similarity(self, title1: str, title2: str) -> float:
         """
@@ -380,18 +443,71 @@ class RSSProcessor:
 
     def _store_embedding(self, article_id: int, embedding: List[float]) -> None:
         """
-        Store an embedding vector in the Annoy index.
+        Buffer an embedding vector for the next index rebuild.
+
+        Only validated, searchable vectors are buffered; ``embedding_generated``
+        is updated later in ``_flush_embeddings`` once the vector is actually
+        persisted and part of a rebuilt index.
 
         Args:
             article_id: ID of the article
             embedding: Embedding vector
+
+        Raises:
+            ValueError: If the vector is not usable for the index.
         """
+        vector = self._coerce_embedding(embedding)
+        if vector is None:
+            raise ValueError(f"refusing to store unusable embedding for article {article_id}")
+
         # Buffer embeddings for batch rebuild (Annoy indices are immutable after build)
         if not hasattr(self, '_pending_embeddings'):
             self._pending_embeddings = {}
-        self._pending_embeddings[article_id] = embedding
+        self._pending_embeddings[article_id] = vector
 
-    def _flush_embeddings(self) -> int:
+    def _collect_indexable_vectors(self) -> Tuple[Dict[int, List[float]], int]:
+        """
+        Load every usable vector from the database, keyed by article id.
+
+        Articles flagged with ``embedding_generated`` whose stored vector is
+        missing or malformed are repaired/reflagged here: the flag is cleared so
+        a later backfill run will regenerate them, and any junk vector is
+        dropped. This keeps ``embedding_generated`` meaning "has a vector that is
+        actually in the index".
+
+        The flag is never set *up* here: only a successful index save can claim
+        that a vector is searchable.
+
+        Returns:
+            Tuple of (usable vectors by article id, number of flags cleared).
+        """
+        vectors: Dict[int, List[float]] = {}
+        cleared = 0
+
+        candidates = self.db_session.query(Article).filter(
+            or_(
+                Article.embedding_generated == True,  # noqa: E712
+                Article.embedding_vector.isnot(None),
+            )
+        ).all()
+
+        for article in candidates:
+            vector = self._parse_stored_vector(article.embedding_vector)
+            if vector is None:
+                # Vector is missing or corrupt: drop it and clear the flag so the
+                # article is picked up by the next backfill.
+                if article.embedding_vector is not None:
+                    article.embedding_vector = None
+                if article.embedding_generated:
+                    article.embedding_generated = False
+                    cleared += 1
+                continue
+
+            vectors[article.id] = vector
+
+        return vectors, cleared
+
+    def _flush_embeddings(self, rebuild_index: bool = False) -> int:
         """
         Rebuild the Annoy index from all embedding vectors stored in the database.
 
@@ -399,64 +515,150 @@ class RSSProcessor:
         whenever new embeddings are added. Embedding vectors are persisted in the
         Article.embedding_vector column so rebuilds don't require re-computation.
 
+        A single bad vector must never abort the rebuild: usable vectors are
+        indexed, unusable ones are skipped and flagged for regeneration. The
+        index file is written atomically so a crash mid-write cannot leave a
+        corrupt index behind.
+
+        Args:
+            rebuild_index: Rebuild even when there is nothing new to index (used
+                to repair a missing or corrupt index file from stored vectors).
+
         Returns:
-            Number of new embeddings added in this batch
+            Number of pending embeddings persisted in this batch
         """
         pending = getattr(self, '_pending_embeddings', {})
-        if not pending:
-            return 0
+        self._pending_embeddings = {}
 
-        # Persist pending vectors to the database
-        for article_id, embedding in pending.items():
+        # Persist pending vectors to the database. Each vector was validated
+        # in _store_embedding, so this cannot introduce junk.
+        if pending:
+            for article_id, embedding in pending.items():
+                article = self.db_session.query(Article).filter_by(id=article_id).first()
+                if article:
+                    article.embedding_vector = json.dumps(embedding)
+            self.db_session.commit()
+
+        # Collect and validate every stored vector, repairing stale flags.
+        vectors, cleared_flags = self._collect_indexable_vectors()
+        if cleared_flags:
+            logger.warning(
+                f"Cleared embedding_generated for {cleared_flags} article(s) with missing "
+                f"or invalid vectors; the next backfill will regenerate them"
+            )
+
+        index_missing = not os.path.exists(self.config.annoy_index_path)
+        if not pending and not cleared_flags and not index_missing and not rebuild_index:
+            # Nothing new to index and nothing to repair. Leave a healthy index
+            # untouched, unless the file on disk cannot actually be loaded —
+            # then it is corrupt and must be rebuilt from stored vectors.
+            if self._index_file_healthy() or not vectors:
+                return 0
+            logger.warning("Stored vector index is unreadable; rebuilding from database")
+
+        if not vectors:
+            logger.info("No usable embeddings to index")
+            self.db_session.commit()
+            self._vector_index = None
+            return len(pending)
+
+        # Build the new index one vector at a time. Annoy can still reject a
+        # vector we considered usable (e.g. metric-specific constraints), so a
+        # rejection demotes that article instead of aborting the whole rebuild.
+        new_index = AnnoyIndex(EMBEDDING_DIM, self.config.annoy_metric)
+        skipped: Dict[int, str] = {}
+        for article_id, vector in vectors.items():
+            try:
+                new_index.add_item(article_id, vector)
+            except (IndexError, TypeError, ValueError) as e:
+                skipped[article_id] = str(e)
+
+        for article_id, reason in skipped.items():
+            logger.warning(f"Skipping article {article_id}: Annoy rejected vector: {reason}")
             article = self.db_session.query(Article).filter_by(id=article_id).first()
             if article:
-                article.embedding_vector = json.dumps(embedding)
-        self.db_session.commit()
+                article.embedding_vector = None
+                article.embedding_generated = False
 
-        # Rebuild the full index from all stored vectors
-        embedding_dim = 768  # all-mpnet-base-v2 dimension
-        new_index = AnnoyIndex(embedding_dim, self.config.annoy_metric)
+        indexed = len(vectors) - len(skipped)
+        if indexed <= 0:
+            logger.info("No usable embeddings to index")
+            self.db_session.commit()
+            self._vector_index = None
+            return len(pending)
 
-        articles_with_vectors = self.db_session.query(Article).filter(
-            Article.embedding_generated == True,
-            Article.embedding_vector.isnot(None)
-        ).all()
+        if skipped:
+            # A rejected id may still have been partially registered; rebuild the
+            # clean index from the vectors Annoy accepted before saving.
+            clean_index = AnnoyIndex(EMBEDDING_DIM, self.config.annoy_metric)
+            for article_id, vector in vectors.items():
+                if article_id not in skipped:
+                    clean_index.add_item(article_id, vector)
+            new_index = clean_index
 
-        indexed = 0
-        for article in articles_with_vectors:
-            try:
-                vector = json.loads(article.embedding_vector)
-                new_index.add_item(article.id, vector)
-                indexed += 1
-            except (json.JSONDecodeError, TypeError) as e:
-                logger.warning(f"Skipping article {article.id}: bad embedding vector: {e}")
+        new_index.build(self.config.annoy_n_trees)
+        self._save_index_atomically(new_index)
 
-        if indexed > 0:
-            new_index.build(self.config.annoy_n_trees)
-            new_index.save(self.config.annoy_index_path)
-            logger.info(f"Rebuilt vector index with {indexed} embeddings ({len(pending)} new)")
+        # Only now, after the index containing these vectors is safely on disk,
+        # may an article be flagged as embedded. This is the one place the flag
+        # is set, so it can never claim a vector that is not searchable.
+        indexed_ids = [aid for aid in vectors if aid not in skipped]
+        for article_id in indexed_ids:
+            article = self.db_session.query(Article).filter_by(id=article_id).first()
+            if article:
+                article.embedding_generated = True
+
+        logger.info(
+            f"Rebuilt vector index with {indexed} embeddings ({len(pending)} new)"
+            + (f"; skipped {len(skipped)} unusable" if skipped else "")
+        )
 
         # Clear state for next batch
         self._vector_index = None  # Lazy-reload on next search
-        self._pending_embeddings = {}
+        self.db_session.commit()
 
         return len(pending)
 
+    def _index_file_healthy(self) -> bool:
+        """Return True if the saved index file exists and loads cleanly."""
+        index_path = self.config.annoy_index_path
+        if not os.path.exists(index_path):
+            return False
+        probe = AnnoyIndex(EMBEDDING_DIM, self.config.annoy_metric)
+        try:
+            return bool(probe.load(index_path))
+        except Exception:
+            return False
+
+    def _save_index_atomically(self, index: AnnoyIndex) -> None:
+        """Save an Annoy index via a temp file + atomic rename."""
+        index_path = self.config.annoy_index_path
+        tmp_path = f"{index_path}.tmp.{os.getpid()}"
+        try:
+            index.save(tmp_path)
+            os.replace(tmp_path, index_path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
     def _load_or_create_index(self) -> None:
         """Load the existing Annoy index or create a new one."""
-        embedding_dim = 768  # all-mpnet-base-v2 dimension
-
-        self._vector_index = AnnoyIndex(embedding_dim, self.config.annoy_metric)
+        self._vector_index = AnnoyIndex(EMBEDDING_DIM, self.config.annoy_metric)
 
         # Try to load existing index
-        if os.path.exists(self.config.annoy_index_path):
+        index_path = self.config.annoy_index_path
+        if os.path.exists(index_path):
             try:
-                self._vector_index.load(self.config.annoy_index_path)
-                logger.info(f"Loaded existing vector index from {self.config.annoy_index_path}")
+                if not self._vector_index.load(index_path):
+                    raise OSError("Annoy refused to load the index file")
+                logger.info(f"Loaded existing vector index from {index_path}")
             except Exception as e:
                 logger.error(f"Failed to load vector index: {str(e)}")
                 # Create a new index
-                self._vector_index = AnnoyIndex(embedding_dim, self.config.annoy_metric)
+                self._vector_index = AnnoyIndex(EMBEDDING_DIM, self.config.annoy_metric)
 
     def find_similar_articles(self, article: Article, similarity_threshold: float = None) -> List[Article]:
         """
@@ -497,7 +699,11 @@ class RSSProcessor:
         if article.summary:
             text_to_embed = article.summary + "\n\n" + text_to_embed
 
-        query_embedding = self._generate_embedding(text_to_embed)
+        try:
+            query_embedding = self._generate_embedding(text_to_embed)
+        except Exception as e:
+            logger.warning(f"Cannot embed article {article.id} for similarity: {e}")
+            return []
 
         # Load index if needed
         if self._vector_index is None:
@@ -727,7 +933,6 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                     if article.content:
                         embedding = self._generate_embedding(article.content)
                         self._store_embedding(article.id, embedding)
-                        article.embedding_generated = True
                         stats["with_embedding"] += 1
                 except Exception as e:
                     logger.error(f"Error generating embedding for article {article.id}: {str(e)}")
@@ -820,7 +1025,19 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         Generate embeddings for processed articles that are missing them.
 
         This handles the case where articles were processed before the embedding
-        fix was applied, leaving them with processed=True but no embedding data.
+        fix was applied, leaving them with processed=True but no embedding data,
+        as well as articles whose stored vector turned out to be unusable.
+
+        Progress is durable and resumable:
+
+        - ``processed=True`` articles are the only candidates.
+        - ``embedding_generated`` is set only after the article's vector has been
+          persisted *and* is part of a successfully saved index, so a failed run
+          never claims progress it did not make.
+        - Each batch is committed together with table-wide integrity maintenance,
+          so a crash or interrupt keeps every article completed before it.
+        - Re-running skips articles that already have a valid, indexed vector,
+          making repeated runs idempotent.
 
         Args:
             batch_size: Number of articles to process per batch before flushing
@@ -828,24 +1045,43 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         Returns:
             Dictionary with backfill statistics
         """
-        # Find articles that are processed but missing embeddings
+        # Reconcile first: any article flagged as embedded whose stored vector is
+        # missing or malformed has its flag cleared (and junk dropped) here, so a
+        # corrupt row is repaired by *this* run rather than the next one.
+        _, cleared_flags = self._collect_indexable_vectors()
+        if cleared_flags:
+            logger.warning(
+                f"Found {cleared_flags} article(s) flagged as embedded with missing or "
+                f"invalid vectors; re-queueing them for regeneration"
+            )
+        self.db_session.commit()
+
+        # Find articles that are processed but missing embeddings.
         # Check both embedding_vector IS NULL and embedding_generated=False
-        # to catch all cases (e.g., articles processed during ingestion skip embeddings)
-        from sqlalchemy import or_
+        # to catch all cases (e.g., articles processed during ingestion skip embeddings).
         missing = self.db_session.query(Article).filter(
-            Article.processed == True,
+            Article.processed == True,  # noqa: E712
             or_(
                 Article.embedding_vector.is_(None),
-                Article.embedding_generated == False
-            )
-        ).all()
+                Article.embedding_generated == False,  # noqa: E712
+            ),
+        ).order_by(Article.id).all()
 
         if not missing:
+            # Nothing new to embed, but the index may be missing or corrupt while
+            # articles still carry valid vectors. Repair it so "embedded" keeps
+            # meaning "searchable", without recomputing anything.
+            if not self._index_file_healthy():
+                logger.warning(
+                    "Vector index is missing or unreadable; rebuilding from stored vectors"
+                )
+                self._flush_embeddings(rebuild_index=True)
             logger.info("No articles missing embeddings")
             return {"total": 0, "succeeded": 0, "failed": 0}
 
         stats = {"total": len(missing), "succeeded": 0, "failed": 0}
         logger.info(f"Backfilling embeddings for {len(missing)} articles...")
+        batch_size = max(1, batch_size)
 
         with Progress(
             SpinnerColumn(),
@@ -860,15 +1096,31 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                 "[bold]Backfilling embeddings", total=len(missing)
             )
 
-            for i, article in enumerate(missing):
+            since_flush = 0
+            for article in missing:
+                # If a previous interrupted run already persisted a usable vector,
+                # do not recompute it: re-queue it so it is folded into the index.
+                stored = self._parse_stored_vector(article.embedding_vector)
+                if stored is not None:
+                    self._store_embedding(article.id, stored)
+                    since_flush += 1
+                    progress.update(task, advance=1)
+                    if since_flush >= batch_size:
+                        stats["succeeded"] += self._commit_embedding_batch()
+                        since_flush = 0
+                    continue
+
                 try:
                     text = article.content or article.summary or article.description
                     if text:
                         embedding = self._generate_embedding(text)
                         self._store_embedding(article.id, embedding)
-                        article.embedding_generated = True
-                        stats["succeeded"] += 1
+                        since_flush += 1
                     else:
+                        logger.warning(
+                            f"Article {article.id} has no content, summary, or description; "
+                            f"leaving it unembedded"
+                        )
                         stats["failed"] += 1
                 except Exception as e:
                     logger.error(
@@ -877,16 +1129,64 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                     stats["failed"] += 1
                 progress.update(task, advance=1)
 
-                # Flush in batches to avoid unbounded memory usage
-                if (i + 1) % batch_size == 0:
-                    self._flush_embeddings()
-                    self.db_session.commit()
+                # Flush in batches. A batch that cannot be committed only costs
+                # the vectors generated since the previous flush.
+                if since_flush >= batch_size:
+                    stats["succeeded"] += self._commit_embedding_batch()
+                    since_flush = 0
 
             # Final flush for remaining embeddings
-            self._flush_embeddings()
-            self.db_session.commit()
+            if since_flush:
+                stats["succeeded"] += self._commit_embedding_batch()
+            else:
+                # No new vectors, but the index may still need repair (missing or
+                # corrupt file) while stored vectors are valid.
+                self._flush_embeddings()
+                self.db_session.commit()
+
+        # Reconcile the reported success count with what is actually indexed now.
+        indexed_now = self.db_session.query(Article).filter(
+            Article.embedding_generated == True  # noqa: E712
+        ).count()
+        logger.info(
+            f"Backfill finished: {stats['succeeded']}/{stats['total']} succeeded, "
+            f"{stats['failed']} failed, {indexed_now} total articles indexed"
+        )
 
         return stats
+
+    def _commit_embedding_batch(self) -> int:
+        """
+        Persist buffered vectors, rebuild the index, and update flags atomically.
+
+        ``embedding_generated`` is set only for articles whose vector made it into
+        the freshly saved index. Articles that failed validation are left flagged
+        False so the next run retries them.
+
+        Returns:
+            Number of buffered articles that now hold a usable, indexed vector.
+        """
+        pending = getattr(self, '_pending_embeddings', {})
+        if not pending:
+            return 0
+
+        pending_ids = set(pending)
+
+        # Persist vectors and rebuild/save the index inside _flush_embeddings.
+        # That call also reconciles embedding_generated for every stored vector.
+        self._flush_embeddings()
+
+        # Count only pending articles that now hold a usable stored vector, i.e.
+        # whose vector was part of the index that was just saved. Articles whose
+        # vectors failed validation stay flagged False for the next run.
+        succeeded = 0
+        for article_id in pending_ids:
+            article = self.db_session.query(Article).filter_by(id=article_id).first()
+            if article and self._parse_stored_vector(article.embedding_vector) is not None:
+                succeeded += 1
+
+        self.db_session.commit()
+        return succeeded
 
     def _update_feed_statistics(self, feed_stats: Dict[int, Dict[str, Any]]):
         """
@@ -948,7 +1248,11 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                 return []
 
         # Generate query embedding
-        query_embedding = self._generate_embedding(query)
+        try:
+            query_embedding = self._generate_embedding(query)
+        except Exception as e:
+            logger.warning(f"Cannot embed search query: {e}")
+            return []
 
         # Search for similar articles
         similar_ids, distances = self._vector_index.get_nns_by_vector(
